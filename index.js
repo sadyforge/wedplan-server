@@ -1,7 +1,7 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
-import { MongoClient } from "mongodb";
+import { MongoClient, ObjectId } from "mongodb";
 
 
 
@@ -78,7 +78,112 @@ app.get("/services",async(req,res)=>{
     const result=await services.find({}).toArray()
     res.send(result)
 })
+// Get Single Service
+app.get("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const query = { _id: new ObjectId(id) };
 
+    const result = await services.findOne(query);
+
+    if (!result) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      data: result,
+    });
+  } catch (error) {
+    console.error("Get single service error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to fetch service",
+    });
+  }
+});
+
+//update
+app.patch("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const data = req.body;
+
+    const updateData = {};
+
+    if (data.serviceName !== undefined) updateData.serviceName = data.serviceName;
+    if (data.category !== undefined) updateData.category = data.category;
+    if (data.description !== undefined) updateData.description = data.description;
+    if (data.price !== undefined) updateData.price = Number(data.price);
+    if (data.location !== undefined) updateData.location = data.location;
+    if (data.image !== undefined) updateData.image = data.image;
+
+    const result = await services.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updateData }
+    );
+
+    if (result.matchedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found",
+      });
+    }
+
+    res.send({
+      success: true,
+      message: "Service updated successfully",
+    });
+  } catch (error) {
+    console.error("Update service error:", error);
+
+    res.status(500).send({
+      success: false,
+      message: "Failed to update service",
+    });
+  }
+});
+
+
+//delete route
+// Delete Service
+app.delete("/services/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid service ID.",
+      });
+    }
+
+    const query = { _id: new ObjectId(id) };
+
+    const result = await services.deleteOne(query);
+
+    if (result.deletedCount === 0) {
+      return res.status(404).send({
+        success: false,
+        message: "Service not found.",
+      });
+    }
+
+    res.send({
+      success: true,
+      message: "Service deleted successfully.",
+    });
+  } catch (error) {
+    res.status(500).send({
+      success: false,
+      message: "Failed to delete service.",
+    });
+  }
+});
 
 
 
