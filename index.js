@@ -34,6 +34,7 @@ const database = client.db("wedplan");
 
 const payments = database.collection("payments");
 const services=database.collection("service")
+const browseService=database.collection("browse-service")
 
 // ensure database connection before handling requests
 app.use(async (req, res, next) => {
@@ -187,134 +188,34 @@ app.delete("/services/:id", async (req, res) => {
 
 
 
+//browse service
+app.get("/browse-service",async(req,res)=>{
+  const result=await browseService.find({}).toArray()
+  res.send(result)
+})
 
+// Get single browse service
+app.get("/browse-service/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
 
-// const verifyToken = async (req, res, next) => {
-//   const authHeader = req.headers.authorization;
-//   if (!authHeader) {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   const token = authHeader.split(" ")[1];
-//   if (!token) {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   const query = { token };
-//   const session = await sessions.findOne(query);
-//   if (!session) {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   const userId = session.userId;
-//   const userQuery = { _id: new ObjectId(userId) };
-//   const user = await users.findOne(userQuery);
-//   if (!user) {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   req.user = user;
-//   next();
-// };
+    const query = { _id: new ObjectId(id) };
 
-// // must call this middleware after verifyTOken
-// const verifySeeker = async (req, res, next) => {
-//   if (req.user.role !== "seeker") {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   next();
-// };
+    const result = await browseService.findOne(query);
 
-// const verifyRecruiter = async (req, res, next) => {
-//   if (req.user.role !== "recruiter") {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   next();
-// };
+    if (!result) {
+      return res.status(404).send({
+        message: "Service not found",
+      });
+    }
 
-// const verifyAdmin = async (req, res, next) => {
-//   if (req.user.role !== "admin") {
-//     res.status(401).send({ message: "unauthorized" });
-//     return;
-//   }
-//   next();
-// };
-
-
-
-// // payment related apis
-// app.post("/payments/checkout-verify", async (req, res) => {
-//   try {
-//     const { sessionId } = req.body;
-
-//     if (!sessionId) {
-//       return res.send({
-//         success: false,
-//         message: "Session ID is required",
-//       });
-//     }
-
-//     const {
-//       status,
-//       payment_status,
-//       customer_email,
-//       metadata,
-//       payment_intent,
-//     } = await stripe.checkout.sessions.retrieve(sessionId);
-
-//     if (status === "complete" && payment_status === "paid") {
-//       const sessionQuery = { sessionId };
-//       const existingPayment = await payments.findOne(sessionQuery);
-
-//       if (existingPayment) {
-//         return res.send({
-//           success: false,
-//           message: "Payment already verified",
-//         });
-//       }
-
-//       const payment = {
-//         sessionId,
-//         status,
-//         payment_status,
-//         customer_email,
-//         userId: metadata.userId,
-//         payment_date: new Date(),
-//         payment_intent,
-//       };
-
-//       const result = await payments.insertOne(payment);
-
-//       // update user table
-//       const query = { _id: new ObjectId(metadata.userId) };
-
-//       const updatedDoc = {
-//         $set: {
-//           premium: true,
-//         },
-//       };
-
-//       const updateResult = await users.updateOne(query, updatedDoc);
-
-//       res.send({ success: true, result, updateResult });
-//       return;
-//     }
-
-//     res.send({
-//       success: false,
-//       message: "Payment verification failed",
-//     });
-//   } catch (error) {
-//     console.error(error);
-
-//     res.status(500).send({
-//       success: false,
-//       message: "Payment verification error",
-//     });
-//   }
-// });
+    res.send(result);
+  } catch (error) {
+    res.status(500).send({
+      message: "Failed to fetch service",
+    });
+  }
+});
 
 
 app.listen(port,()=>{
