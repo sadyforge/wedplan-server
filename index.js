@@ -6,7 +6,7 @@ import Stripe from "stripe";
 import { MongoClient, ObjectId } from "mongodb";
 import { createHmac, timingSafeEqual } from "node:crypto";
 
-const stripe=new Stripe(process.env.STRIPE_SECRET_KEY)
+const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
 const app = express();
 const port = process.env.PORT || 5000;
 const jwtIssuer = process.env.BACKEND_JWT_ISSUER || "wedplan-client";
@@ -14,13 +14,15 @@ const jwtAudience = process.env.BACKEND_JWT_AUDIENCE || "wedplan-api";
 
 
 // middleware
-app.use(express.json({
-  verify: (req, _res, buffer) => {
-    if (req.originalUrl === "/payments/webhook") {
-      req.rawBody = Buffer.from(buffer);
-    }
-  },
-}));
+app.use(
+  express.json({
+    verify: (req, _res, buffer) => {
+      if (req.path === "/payments/webhook") {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  })
+);
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -44,20 +46,65 @@ export async function connectToMongoDB() {
   }
 }
 
+
+async function createPaymentIndexes() {
+  await transactionsCollection.createIndex(
+    { stripeInvoiceId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: {
+        stripeInvoiceId: { $type: "string" },
+      },
+    }
+  );
+
+  await transactionsCollection.createIndex(
+    { stripeSessionId: 1 },
+    {
+      unique: true,
+      partialFilterExpression: {
+        stripeSessionId: { $type: "string" },
+      },
+    }
+  );
+
+  await webhookEvents.createIndex(
+    { eventId: 1 },
+    { unique: true }
+  );
+
+  await transactionsCollection.createIndex({
+    vendorId: 1,
+    createdAt: -1,
+  });
+
+  await transactionsCollection.createIndex({
+    vendorId: 1,
+    stripeSubscriptionId: 1,
+    paymentDate: -1,
+  });
+}
+
+
 const databaseConnection = connectToMongoDB();
 const database = client.db("wedplan");
 
-const payments = database.collection("payments");
+// Better Auth (usePlural: false) stores accounts in singular collections:
+// "user", "session", "account", "verification". Services live in "service".
+// Transactions use the dedicated "transactions" collection (migrated from legacy "payments").
 const services = database.collection("service");
 const users = database.collection("user");
 const bookingsCollection =database.collection("bookings");
-const transactionsCollection = database.collection("payments");
+const transactionsCollection = database.collection("transactions");
 const webhookEvents = database.collection("stripe_webhook_events");
 
-const myLogger=(req,res,next)=>{
-  console.log("now hitting the api",req.url, req.query)
-  next()
-}
+await databaseConnection;
+await createPaymentIndexes();
+
+// const myLogger=(req,res,next)=>{
+//   console.log("now hitting the api",req.url, req.query)
+//   next()
+// }
 
 const base64UrlDecode = (value) => Buffer.from(value, "base64url").toString("utf8");
 
@@ -155,55 +202,145 @@ const isActiveSubscription = (status) =>
 
 function subscriptionFields(subscription) {
   const active = isActiveSubscription(subscription.status);
+
   return {
     subscriptionPlan: active ? "Premium" : "Free",
-    subscriptionStatus: active ? "active" : "inactive",
+    subscriptionStatus: String(subscription.status || "incomplete"),
+    premium: active,
+
     subscriptionId: String(subscription.id),
-    stripeCustomerId: subscription.customer?.toString?.() || subscription.customer || null,
+
+    stripeCustomerId:
+      subscription.customer?.toString?.() ||
+      subscription.customer ||
+      null,
+
     subscriptionStartedAt: subscription.start_date
       ? new Date(subscription.start_date * 1000)
       : new Date(),
+
     subscriptionExpiresAt: subscription.current_period_end
       ? new Date(subscription.current_period_end * 1000)
       : null,
+
     subscriptionCancelledAt: subscription.canceled_at
       ? new Date(subscription.canceled_at * 1000)
       : null,
-    subscriptionCancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+
+    subscriptionCancelAtPeriodEnd: Boolean(
+      subscription.cancel_at_period_end
+    ),
   };
 }
 
 async function updateVendorSubscription(userId, subscription) {
-  if (!userId || !ObjectId.isValid(userId)) return false;
+  if (!userId || !ObjectId.isValid(userId)) {
+    throw new Error("Invalid vendor ID");
+  }
+
   const result = await users.updateOne(
-    { _id: new ObjectId(userId) },
-    { $set: subscriptionFields(subscription) }
+    {
+      _id: new ObjectId(userId),
+      role: "vendor",
+    },
+    {
+      $set: subscriptionFields(subscription),
+    }
   );
-  return result.matchedCount > 0;
+
+  console.log("MongoDB subscription update result:", {
+    userId,
+    subscriptionId: subscription.id,
+    status: subscription.status,
+    matchedCount: result.matchedCount,
+    modifiedCount: result.modifiedCount,
+  });
+
+  if (result.matchedCount !== 1) {
+    throw new Error("Vendor not found");
+  }
+
+  return result;
 }
 
 async function recordTransaction(transaction) {
-  if (transaction.vendorId && ObjectId.isValid(String(transaction.vendorId))) {
-    const vendor = await users.findOne(
-      { _id: new ObjectId(String(transaction.vendorId)) },
-      { projection: { name: 1, email: 1 } }
-    );
-    transaction = {
-      ...transaction,
-      vendorName: transaction.vendorName || vendor?.name || "Vendor",
-      vendorEmail: transaction.vendorEmail || vendor?.email || "",
-    };
+  const vendorId = String(transaction.vendorId || "");
+
+  if (!ObjectId.isValid(vendorId)) {
+    throw new Error("Invalid transaction vendor ID");
   }
-  const key = transaction.stripeInvoiceId || transaction.stripeSessionId;
-  if (!key) return;
-  await transactionsCollection.updateOne(
-    transaction.stripeInvoiceId
-      ? { stripeInvoiceId: transaction.stripeInvoiceId }
-      : { stripeSessionId: transaction.stripeSessionId },
-    { $setOnInsert: transaction },
-    { upsert: true }
+
+  const vendor = await users.findOne(
+    {
+      _id: new ObjectId(vendorId),
+      role: "vendor",
+    },
+    {
+      projection: {
+        name: 1,
+        email: 1,
+      },
+    }
+  );
+
+  if (!vendor) {
+    throw new Error("Transaction vendor not found");
+  }
+
+  const transactionData = {
+    ...transaction,
+    vendorId,
+    vendorName: vendor.name || "Vendor",
+    vendorEmail: vendor.email || "",
+    paymentDate: transaction.paymentDate || transaction.createdAt || new Date(),
+    createdAt: transaction.createdAt || new Date(),
+  };
+
+  if (transaction.stripeInvoiceId) {
+    await transactionsCollection.updateOne(
+      {
+        stripeInvoiceId: transaction.stripeInvoiceId,
+      },
+      {
+        $setOnInsert: transactionData,
+      },
+      {
+        upsert: true,
+      }
+    );
+
+    return;
+  }
+
+  if (transaction.stripeSessionId) {
+    await transactionsCollection.updateOne(
+      {
+        stripeSessionId: transaction.stripeSessionId,
+      },
+      {
+        $setOnInsert: transactionData,
+      },
+      {
+        upsert: true,
+      }
+    );
+
+    return;
+  }
+
+  throw new Error("Stripe transaction reference is required");
+}
+
+function getInvoiceSubscriptionId(invoice) {
+  return (
+    invoice.subscription?.toString?.() ||
+    invoice.subscription ||
+    invoice.parent?.subscription_details?.subscription?.toString?.() ||
+    invoice.parent?.subscription_details?.subscription ||
+    null
   );
 }
+
 
 async function getAuthenticatedUser(req) {
   return req.user || null;
@@ -434,13 +571,13 @@ app.post("/services",verifyToken,
     });
 
     const isPremium =
-      vendor?.subscriptionPlan === "Premium" &&
-      vendor?.subscriptionStatus === "active";
+      vendor?.premium === true &&
+      isActiveSubscription(vendor?.subscriptionStatus);
 
     if (!isPremium) {
       const serviceCount = await services.countDocuments({
         vendorId: String(user.id),
-        status: { $in: ["pending", "approved"] },
+        status: { $in: ["pending", "approved", "active", "published"] },
       });
 
       if (serviceCount >= 3) {
@@ -750,7 +887,7 @@ app.patch("/services/:id", verifyToken,
 
     const existingService = await services.findOne({
       _id: new ObjectId(id),
-      $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
+      vendorId: user.id,
     });
 
     if (!existingService) {
@@ -784,7 +921,7 @@ app.patch("/services/:id", verifyToken,
     const result = await services.updateOne(
       {
         _id: new ObjectId(id),
-        $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
+        vendorId: user.id,
       },
       {
         $set: {
@@ -845,7 +982,7 @@ async (req, res) => {
       ? { _id: new ObjectId(id) }
       : {
           _id: new ObjectId(id),
-          $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
+          vendorId: user.id,
         };
     const result = await services.deleteOne(filter);
 
@@ -986,6 +1123,56 @@ app.patch("/services/:id/reject",  verifyToken,
 });
 
 
+// Attach vendor information to service documents so public cards and the
+// service details page can display "Vendor Information" as required.
+async function withVendorInfo(services) {
+  const list = Array.isArray(services) ? services : [services];
+
+  const vendorIds = [
+    ...new Set(
+      list
+        .map((s) => String(s?.vendorId || ""))
+        .filter((id) => ObjectId.isValid(id))
+    ),
+  ];
+  const vendorEmails = [
+    ...new Set(
+      list.map((s) => String(s?.vendorEmail || "").toLowerCase()).filter(Boolean)
+    ),
+  ];
+
+  const or = [];
+  if (vendorIds.length) or.push({ _id: { $in: vendorIds.map((id) => new ObjectId(id)) } });
+  if (vendorEmails.length)
+    or.push({ email: { $in: vendorEmails } });
+
+  const vendors = or.length
+    ? await users
+        .find({ $or: or }, { projection: { name: 1, email: 1, image: 1 } })
+        .toArray()
+    : [];
+
+  const byId = new Map(vendors.map((v) => [String(v._id), v]));
+  const byEmail = new Map(vendors.map((v) => [String(v.email || "").toLowerCase(), v]));
+
+  const decorate = (service) => {
+    if (!service) return service;
+    const vendor =
+      byId.get(String(service.vendorId || "")) ||
+      byEmail.get(String(service.vendorEmail || "").toLowerCase());
+
+    return {
+      ...service,
+      vendorName: service.vendorName || vendor?.name || "",
+      vendorEmail: service.vendorEmail || vendor?.email || "",
+      vendorImage: service.vendorImage || vendor?.image || "",
+    };
+  };
+
+  return Array.isArray(services) ? list.map(decorate) : decorate(list);
+}
+
+
 // get only approved services for Browse Services
 app.get("/browse-service", async (req, res) => {
   try {
@@ -994,7 +1181,7 @@ app.get("/browse-service", async (req, res) => {
       .sort({ approvedAt: -1 })
       .toArray();
 
-    res.send(result);
+    res.send(await withVendorInfo(result));
   } catch (error) {
     console.error("Browse services error:", error);
 
@@ -1030,7 +1217,7 @@ app.get("/browse-service/:id", async (req, res) => {
       });
     }
 
-    res.send(result);
+    res.send(await withVendorInfo(result));
   } catch (error) {
     console.error("Browse single service error:", error);
 
@@ -1429,199 +1616,983 @@ app.patch("/bookings/:id/status", async (req, res) => {
 });
 
 
-//payments related apis
-app.post("/payments/checkout-verify", async (req, res) => {
-  try {
-    const { sessionId } = req.body;
-    const authenticatedUser = await getAuthenticatedUser(req);
 
-    if (!authenticatedUser || authenticatedUser.role !== "vendor") {
-      return res.status(401).send({
+//middleware payment
+// const isActiveSubscription = (status) => {
+//   return status === "active" || status === "trialing";
+// };
+
+// const subscriptionFields = (subscription) => {
+//   return {
+//     subscriptionPlan: isActiveSubscription(subscription.status)
+//       ? "Premium"
+//       : "Free",
+
+//     subscriptionStatus: subscription.status,
+
+//     subscriptionId: subscription.id,
+
+//     stripeCustomerId: subscription.customer?.toString(),
+
+//     subscriptionStartedAt: new Date(
+//       subscription.start_date * 1000
+//     ),
+
+//     subscriptionExpiresAt: new Date(
+//       subscription.current_period_end * 1000
+//     ),
+
+//     subscriptionCancelAtPeriodEnd:
+//       subscription.cancel_at_period_end,
+
+//     subscriptionCancelledAt: subscription.canceled_at
+//       ? new Date(subscription.canceled_at * 1000)
+//       : null,
+
+//     premium: isActiveSubscription(subscription.status),
+//   };
+// };
+
+//payments related apis
+
+app.post("/payments/checkout-verify", verifyToken, verifyRole("vendor"), async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user || user.role !== "vendor") {
+      return res.status(403).json({
         success: false,
         message: "Authenticated vendor access is required.",
       });
     }
 
-    if (!sessionId) {
-      return res.status(400).send({
+    const { sessionId } = req.body;
+
+    if (
+      typeof sessionId !== "string" ||
+      !sessionId.startsWith("cs_test_") &&
+      !sessionId.startsWith("cs_live_")
+    ) {
+      return res.status(400).json({
         success: false,
-        message: "Session ID is required",
+        message: "Invalid checkout session ID.",
       });
     }
 
-    const session = await stripe.checkout.sessions.retrieve(sessionId);
-
-    const {
-      status,
-      payment_status,
-      payment_intent,
-      metadata,
-      customer_email,
-    } = session;
-
-    if (status !== "complete" || payment_status !== "paid") {
-      return res.status(400).send({
-        success: false,
-        message: "Payment verification failed",
-      });
-    }
-
-    if (!metadata?.userId || !ObjectId.isValid(metadata.userId)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid user information",
-      });
-    }
-
-    if (String(authenticatedUser.id) !== String(metadata.userId)) {
-      return res.status(403).send({
-        success: false,
-        message: "This checkout session does not belong to the authenticated vendor.",
-      });
-    }
-
-    const subscription = session.subscription
-      ? await stripe.subscriptions.retrieve(session.subscription)
-      : null;
-    const vendor = await users.findOne({ _id: new ObjectId(metadata.userId) });
-
-    if (!vendor || !subscription || !isActiveSubscription(subscription.status)) {
-      return res.status(400).send({
-        success: false,
-        message: "Payment verification failed because the subscription is not active.",
-      });
-    }
-
-    const subscriptionData = subscriptionFields(subscription);
-    await users.updateOne(
-      { _id: new ObjectId(metadata.userId) },
-      { $set: { ...subscriptionData, premium: true } }
+    const session = await stripe.checkout.sessions.retrieve(
+      sessionId
     );
 
-    await recordTransaction({
-      vendorId: metadata.userId,
-      plan: "Premium",
-      amount: (session.amount_total || 0) / 100,
-      currency: session.currency,
-      stripeSessionId: session.id,
-      stripeSubscriptionId: subscription.id,
-      status: "paid",
-      createdAt: new Date(),
-    });
+    if (session.metadata?.userId !== String(user.id)) {
+      return res.status(403).json({
+        success: false,
+        message: "This checkout session does not belong to you.",
+      });
+    }
 
-    return res.send({
-      success: true,
-      verified: true,
-      subscriptionStatus: "active",
-      subscriptionPlan: "Premium",
-      subscriptionId: subscription.id,
-      message: "Premium subscription activated successfully.",
-    });
+    if (session.mode !== "subscription") {
+      return res.status(400).json({
+        success: false,
+        message: "Invalid subscription session.",
+      });
+    }
+
+    if (
+      session.status !== "complete" ||
+      session.payment_status !== "paid"
+    ) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        message: "Payment has not been completed.",
+      });
+    }
+
+    const subscriptionId =
+      typeof session.subscription === "string"
+        ? session.subscription
+        : session.subscription?.id;
+
+    if (!subscriptionId) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        message: "Subscription not found.",
+      });
+    }
+
+    const subscription = await stripe.subscriptions.retrieve(
+      subscriptionId
+    );
+
+    if (
+      subscription.metadata?.userId !== String(user.id) ||
+      !isActiveSubscription(subscription.status)
+    ) {
+      return res.status(400).json({
+        success: false,
+        verified: false,
+        message: "Active subscription not found.",
+      });
+    }
+
+    // IMPORTANT:
+    // Do not activate Premium here.
+    // Stripe Webhook is the only authority for activation.
+const vendor = await users.findOne({
+  _id: new ObjectId(user.id),
+  role: "vendor",
+});
+
+if (!vendor) {
+  return res.status(404).json({
+    success: false,
+    message: "Vendor not found.",
+  });
+}
+
+if (
+  vendor.subscriptionId &&
+  vendor.subscriptionId !== subscription.id &&
+  vendor.premium === true &&
+  isActiveSubscription(vendor.subscriptionStatus)
+) {
+  return res.status(409).json({
+    success: false,
+    message: "Another active subscription already exists.",
+  });
+}
+
+await updateVendorSubscription(String(user.id), subscription);
+
+const updatedVendor = await users.findOne({
+  _id: new ObjectId(user.id),
+  role: "vendor",
+});
+
+const activated =
+  updatedVendor?.subscriptionId === subscription.id &&
+  updatedVendor?.premium === true &&
+  updatedVendor?.subscriptionPlan === "Premium" &&
+  isActiveSubscription(updatedVendor?.subscriptionStatus);
+
+return res.status(200).json({
+  success: true,
+  verified: true,
+  activated,
+  subscriptionStatus: updatedVendor?.subscriptionStatus,
+  subscriptionPlan: updatedVendor?.subscriptionPlan,
+  message: activated
+    ? "Premium subscription activated successfully."
+    : "Subscription activation failed.",
+});
+
+  
+
   } catch (error) {
-    console.error("Checkout verification error:", error);
+    console.error("Checkout Verification Error:", error);
 
-    return res.status(500).send({
+    return res.status(500).json({
       success: false,
-      message: "Payment verification failed",
+      message: "Payment verification failed.",
     });
   }
 });
 
-app.get("/users/:id/premium",async(req,res)=>{
-  const id=req.params.id
-  const query={_id:new ObjectId(id)}
-  const result=await users.findOne(query,{projection:{premium:1}})
-  res.send(result)
+
+app.get("/users/:id/premium", verifyToken, async(req,res)=>{
+  try {
+    const id=req.params.id;
+    if (!ObjectId.isValid(id)) return res.status(400).json({ success: false, message: "Invalid user ID" });
+    if (req.user.role !== "admin" && String(req.user._id) !== id) {
+      return res.status(403).json({ success: false, message: "You can only view your own premium status" });
+    }
+    const result=await users.findOne({ _id:new ObjectId(id) },{projection:{premium:1, subscriptionPlan:1, subscriptionStatus:1}});
+    if (!result) return res.status(404).json({ success: false, message: "User not found" });
+    res.send(result);
+  } catch (error) {
+    console.error("Get premium status error:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch premium status" });
+  }
 })
 
 
 
+
+
 // 1. Create Stripe Checkout Session
-app.post("/payments/create-checkout-session", async (req, res) => {
-  try {
-    const user = await getAuthenticatedUser(req);
 
-    if (!user) {
-      return res.status(401).json({ message: "Unauthorized access." });
-    }
+// app.post("/payments/create-checkout-session", async (req, res) => {
+//   try {
+//     const user = await getAuthenticatedUser(req);
 
-    if (user.role !== "vendor") {
-      return res.status(403).json({ message: "Only vendors can subscribe." });
-    }
+//     if (!user || user.role !== "vendor") {
+//       return res.status(403).json({
+//         success: false,
+//         message: "Only authenticated vendors can subscribe.",
+//       });
+//     }
 
-    const userId = user._id?.toString() || user.id;
+//     const userId = String(user.id);
 
-    if (!userId) {
-      return res.status(400).json({ message: "User ID not found." });
-    }
+//     if (!ObjectId.isValid(userId)) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "Invalid vendor ID.",
+//       });
+//     }
 
-    const existingUser = await users.findOne({
-      _id: new ObjectId(userId),
-    });
+//     const vendor = await users.findOne({
+//       _id: new ObjectId(userId),
+//       role: "vendor",
+//     });
 
-    if (!existingUser) {
-      return res.status(404).json({ message: "Vendor not found." });
-    }
+//     if (!vendor) {
+//       return res.status(404).json({
+//         success: false,
+//         message: "Vendor not found.",
+//       });
+//     }
 
-    if (
-      existingUser.subscriptionPlan === "Premium" &&
-      existingUser.subscriptionStatus === "active"
-    ) {
-      return res.status(400).json({
-        message: "You already have a Premium subscription.",
+//     if (
+//       vendor.subscriptionPlan === "Premium" &&
+//       vendor.subscriptionStatus === "active"
+//     ) {
+//       return res.status(400).json({
+//         success: false,
+//         message: "You already have an active Premium subscription.",
+//       });
+//     }
+
+//     const priceId = process.env.PREMIUM_PRICE_ID;
+
+//     let lineItem;
+
+//     if (priceId) {
+//       lineItem = {
+//         price: priceId,
+//         quantity: 1,
+//       };
+//     } else {
+//       const amount = Number(
+//         process.env.PREMIUM_PRICE_AMOUNT || 99900
+//       );
+
+//       if (!Number.isInteger(amount) || amount <= 0) {
+//         return res.status(400).json({
+//           success: false,
+//           message: "Invalid Premium subscription amount.",
+//         });
+//       }
+
+//       lineItem = {
+//         price_data: {
+//           currency: (
+//             process.env.PREMIUM_CURRENCY || "bdt"
+//           ).toLowerCase(),
+
+//           product_data: {
+//             name: "WedPlan Premium",
+//             description:
+//               "Unlimited active services and Premium membership.",
+//           },
+
+//           unit_amount: amount,
+
+//           recurring: {
+//             interval: "month",
+//           },
+//         },
+
+//         quantity: 1,
+//       };
+//     }
+
+//     const session = await stripe.checkout.sessions.create({
+//       mode: "subscription",
+
+//       line_items: [lineItem],
+
+//       customer_email: user.email,
+
+//       client_reference_id: userId,
+
+//       metadata: {
+//         userId,
+//       },
+
+//       subscription_data: {
+//         metadata: {
+//           userId,
+//         },
+//       },
+
+//       success_url:
+//         `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+
+//       cancel_url:
+//         `${process.env.CLIENT_URL}/payment-cancel`,
+//     });
+
+//     return res.status(200).json({
+//       success: true,
+//       url: session.url,
+//       sessionId: session.id,
+//     });
+
+//   } catch (error) {
+//     console.error("Checkout Session Error:", error);
+
+//     return res.status(500).json({
+//       success: false,
+//       message: "Failed to create checkout session.",
+//     });
+//   }
+// });
+
+
+app.post(
+  "/payments/create-checkout-session",
+  verifyToken,
+  verifyRole("vendor"),
+  async (req, res) => {
+    try {
+      const user = await getAuthenticatedUser(req);
+
+      if (!user || user.role !== "vendor") {
+        return res.status(403).json({
+          success: false,
+          message: "Only authenticated vendors can subscribe.",
+        });
+      }
+
+      const userId = String(user.id || user._id || "");
+
+      if (!ObjectId.isValid(userId)) {
+        return res.status(400).json({
+          success: false,
+          message: "Invalid vendor ID.",
+        });
+      }
+
+      const vendor = await users.findOne({
+        _id: new ObjectId(userId),
+        role: "vendor",
       });
-    }
 
-    const priceId = process.env.PREMIUM_PRICE_ID;
-    const lineItem = priceId
-      ? { price: priceId, quantity: 1 }
-      : {
-          price_data: {
-            currency: (process.env.PREMIUM_CURRENCY || "bdt").toLowerCase(),
-            product_data: {
-              name: "WedPlan Premium",
-              description: "Unlimited active services and Premium badge",
-            },
-            unit_amount: Number(process.env.PREMIUM_PRICE_AMOUNT || 99900),
-            recurring: { interval: "month" },
-          },
+      if (!vendor) {
+        return res.status(404).json({
+          success: false,
+          message: "Vendor not found.",
+        });
+      }
+
+      if (
+        vendor.premium === true &&
+        isActiveSubscription(vendor.subscriptionStatus)
+      ) {
+        return res.status(400).json({
+          success: false,
+          message: "You already have an active Premium subscription.",
+        });
+      }
+
+      const priceId = process.env.PREMIUM_PRICE_ID;
+
+      let lineItem;
+
+      if (priceId) {
+        lineItem = {
+          price: priceId,
           quantity: 1,
         };
+      } else {
+        const amount = Number(
+          process.env.PREMIUM_PRICE_AMOUNT || 99900
+        );
 
-    const session = await stripe.checkout.sessions.create({
-      mode: "subscription",
-      line_items: [lineItem],
+        if (!Number.isInteger(amount) || amount <= 0) {
+          return res.status(400).json({
+            success: false,
+            message: "Invalid Premium subscription amount.",
+          });
+        }
 
-      customer_email: user.email,
+        lineItem = {
+          price_data: {
+            currency: (
+              process.env.PREMIUM_CURRENCY || "bdt"
+            ).toLowerCase(),
 
-      metadata: {
-        userId,
-      },
+            product_data: {
+              name: "WedPlan Premium",
+              description:
+                "Unlimited active services and Premium membership.",
+            },
 
-      subscription_data: {
+            unit_amount: amount,
+
+            recurring: {
+              interval: "month",
+            },
+          },
+
+          quantity: 1,
+        };
+      }
+
+      const checkoutOptions = {
+        mode: "subscription",
+
+        line_items: [lineItem],
+
+        client_reference_id: userId,
+
         metadata: {
           userId,
         },
-      },
 
-      success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
-      cancel_url: `${process.env.CLIENT_URL}/payment-cancel`,
-    });
+        subscription_data: {
+          metadata: {
+            userId,
+          },
+        },
 
-    res.status(200).json({
-      success: true,
-      url: session.url,
-    });
+        success_url:
+          `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+
+        cancel_url:
+          `${process.env.CLIENT_URL}/payment-cancel`,
+      };
+
+      if (vendor.stripeCustomerId) {
+        checkoutOptions.customer = String(
+          vendor.stripeCustomerId
+        );
+      } else if (user.email || vendor.email) {
+        checkoutOptions.customer_email =
+          user.email || vendor.email;
+      } else {
+        return res.status(400).json({
+          success: false,
+          message: "Vendor email not found.",
+        });
+      }
+
+      console.log("Creating Stripe Checkout Session:", {
+        userId,
+        vendorEmail: user.email || vendor.email,
+      });
+
+      const session =
+        await stripe.checkout.sessions.create(checkoutOptions);
+
+      console.log("Stripe Checkout Session created:", {
+        userId,
+        sessionId: session.id,
+        metadataUserId: session.metadata?.userId,
+      });
+      return res.status(200).json({
+        success: true,
+        url: session.url,
+        sessionId: session.id,
+      });
+
+    } catch (error) {
+      console.error("Checkout Session Error:", error);
+
+      return res.status(500).json({
+        success: false,
+        message: "Failed to create checkout session.",
+      });
+    }
+  }
+);
+
+
+//webhook
+app.use(
+  express.json({
+    verify: (req, res, buffer) => {
+      if (req.originalUrl === "/payments/webhook") {
+        req.rawBody = Buffer.from(buffer);
+      }
+    },
+  })
+);
+app.post("/payments/webhook", async (req, res) => {
+  const signature = req.headers["stripe-signature"];
+
+  let event;
+
+  // Verify Stripe webhook signature
+  try {
+    if (!req.rawBody) {
+      console.error("Webhook raw body is missing.");
+
+      return res.status(400).json({
+        success: false,
+        message: "Raw webhook body is missing.",
+      });
+    }
+
+    event = stripe.webhooks.constructEvent(
+      req.rawBody,
+      signature,
+      process.env.STRIPE_WEBHOOK_SECRET
+    );
+
   } catch (error) {
-    console.error("Checkout Session Error:", error);
+    console.error("Webhook Signature Error:", error.message);
 
-    res.status(500).json({
-      message: "Failed to create checkout session.",
+    return res.status(400).json({
+      success: false,
+      message: "Invalid webhook signature.",
+    });
+  }
+
+  try {
+    // Check duplicate event
+    const duplicate = await webhookEvents.findOne({
+      eventId: event.id,
+    });
+
+    if (duplicate) {
+      console.log("Duplicate Stripe Event:", event.id);
+
+      return res.status(200).json({
+        received: true,
+        duplicate: true,
+      });
+    }
+
+    console.log("Processing Stripe Event:", {
+      eventType: event.type,
+      eventId: event.id,
+    });
+
+    switch (event.type) {
+
+      // 1. Checkout completed
+      case "checkout.session.completed": {
+        const session = event.data.object;
+        const rawSubscriptionId = typeof session.subscription === "string"
+          ? session.subscription
+          : session.subscription?.id;
+
+        console.log("Checkout completion payload:", {
+          eventId: event.id,
+          eventType: event.type,
+          sessionId: session.id,
+          paymentStatus: session.payment_status,
+          subscriptionId: rawSubscriptionId || null,
+          metadataUserId: session.metadata?.userId || null,
+        });
+
+        if (session.mode !== "subscription") {
+          throw new Error(`Checkout session ${session.id} was not a subscription session.`);
+        }
+
+        const userId = session.metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+          throw new Error(
+            "Invalid vendor ID in checkout metadata."
+          );
+        }
+
+        if (!rawSubscriptionId) {
+          throw new Error("Subscription ID not found.");
+        }
+
+        const subscription =
+          await stripe.subscriptions.retrieve(rawSubscriptionId);
+
+        console.log("Retrieved checkout subscription:", {
+          eventId: event.id,
+          sessionId: session.id,
+          subscriptionId: subscription.id,
+          subscriptionStatus: subscription.status,
+          metadataUserId: subscription.metadata?.userId || null,
+        });
+
+        if (subscription.metadata?.userId !== userId) {
+          throw new Error("Subscription vendor mismatch.");
+        }
+
+        if (!isActiveSubscription(subscription.status)) {
+          throw new Error(`Subscription ${subscription.id} is not active (${subscription.status}); leaving event retryable.`);
+        }
+
+        const vendor = await users.findOne({
+          _id: new ObjectId(userId),
+          role: "vendor",
+        });
+
+        if (!vendor) {
+          throw new Error(
+            `Vendor not found. MongoDB ID: ${userId}`
+          );
+        }
+
+        const updated = await updateVendorSubscription(
+          userId,
+          subscription
+        );
+
+        if (updated.matchedCount !== 1) {
+          throw new Error(
+            `Failed to update vendor subscription: ${userId}`
+          );
+        }
+
+        const vendorAfterUpdate = await users.findOne(
+          { _id: new ObjectId(userId), role: "vendor" },
+          { projection: { _id: 1, premium: 1, subscriptionPlan: 1, subscriptionStatus: 1, subscriptionId: 1, stripeCustomerId: 1 } }
+        );
+        console.log("Vendor after checkout webhook update:", {
+          eventId: event.id,
+          vendorId: userId,
+          matchedCount: updated.matchedCount,
+          modifiedCount: updated.modifiedCount,
+          vendor: vendorAfterUpdate,
+        });
+
+        if (vendorAfterUpdate?.premium !== true || vendorAfterUpdate?.subscriptionStatus !== "active" || vendorAfterUpdate?.subscriptionId !== subscription.id) {
+          throw new Error(`Vendor subscription readback did not confirm activation for ${userId}.`);
+        }
+
+        console.log("Checkout subscription updated:", {
+          userId,
+          subscriptionId: subscription.id,
+          status: subscription.status,
+        });
+
+        break;
+      }
+
+      // 2. Subscription created or updated
+      case "customer.subscription.created":
+      case "customer.subscription.updated": {
+        const eventSubscription = event.data.object;
+
+        const subscription =
+          await stripe.subscriptions.retrieve(
+            eventSubscription.id
+          );
+
+        const userId = subscription.metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+          throw new Error(
+            "Invalid vendor ID in subscription metadata."
+          );
+        }
+
+        const vendor = await users.findOne({
+          _id: new ObjectId(userId),
+          role: "vendor",
+        });
+
+        console.log("Subscription event payload:", {
+          eventId: event.id,
+          eventType: event.type,
+          subscriptionId: subscription.id,
+          status: subscription.status,
+          metadataUserId: userId,
+          currentSubscriptionId: vendor?.subscriptionId || null,
+        });
+
+        if (!vendor) {
+          throw new Error(
+            `Subscription vendor not found: ${userId}`
+          );
+        }
+
+        // Ignore events from an old subscription
+        if (vendor.subscriptionId && vendor.subscriptionId !== subscription.id &&
+            vendor.premium === true && isActiveSubscription(vendor.subscriptionStatus)) {
+          console.log(
+            "Ignoring old subscription event:",
+            subscription.id
+          );
+          break;
+        }
+
+        const updated = await updateVendorSubscription(
+          userId,
+          subscription
+        );
+
+        if (!updated) {
+          throw new Error(
+            `Failed to update subscription: ${subscription.id}`
+          );
+        }
+
+        console.log("Subscription updated:", {
+          userId,
+          subscriptionId: subscription.id,
+          status: subscription.status,
+          premium: isActiveSubscription(subscription.status),
+        });
+
+        break;
+      }
+
+      // 3. Subscription deleted
+      case "customer.subscription.deleted": {
+        const subscription = event.data.object;
+        const userId = subscription.metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+          throw new Error(
+            "Invalid vendor ID in deleted subscription."
+          );
+        }
+
+        const result = await users.updateOne(
+          {
+            _id: new ObjectId(userId),
+            role: "vendor",
+            subscriptionId: subscription.id,
+          },
+          {
+            $set: {
+              subscriptionPlan: "Free",
+              subscriptionStatus: "canceled",
+              premium: false,
+
+              subscriptionExpiresAt:
+                subscription.current_period_end
+                  ? new Date(
+                      subscription.current_period_end * 1000
+                    )
+                  : null,
+
+              subscriptionCancelledAt:
+                subscription.canceled_at
+                  ? new Date(
+                      subscription.canceled_at * 1000
+                    )
+                  : new Date(),
+
+              subscriptionCancelAtPeriodEnd: false,
+            },
+          }
+        );
+
+        if (result.matchedCount === 0) {
+          console.log(
+            "Deleted subscription did not match current vendor subscription:",
+            subscription.id
+          );
+        }
+
+        console.log("Subscription deleted:", {
+          userId,
+          subscriptionId: subscription.id,
+          updated: result.modifiedCount > 0,
+        });
+
+        break;
+      }
+
+      // 4. Successful invoice payment
+      case "invoice.payment_succeeded": {
+        const invoice = event.data.object;
+
+        const subscriptionId =
+          getInvoiceSubscriptionId(invoice);
+
+        if (!subscriptionId) {
+          console.log(
+            "No subscription ID found in invoice:",
+            invoice.id
+          );
+          break;
+        }
+
+        const subscription =
+          await stripe.subscriptions.retrieve(
+            subscriptionId
+          );
+
+        const userId = subscription.metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+          throw new Error(
+            "Invalid vendor ID in invoice subscription metadata."
+          );
+        }
+
+        const vendor = await users.findOne({
+          _id: new ObjectId(userId),
+          role: "vendor",
+        });
+
+        if (!vendor) {
+          throw new Error(
+            `Invoice vendor not found: ${userId}`
+          );
+        }
+
+        if (
+          vendor.subscriptionId &&
+          vendor.subscriptionId !== subscription.id
+        ) {
+          console.log(
+            "Ignoring invoice from old subscription:",
+            subscription.id
+          );
+          break;
+        }
+
+        const updated = await updateVendorSubscription(
+          userId,
+          subscription
+        );
+
+        if (!updated) {
+          throw new Error(
+            `Failed to activate vendor subscription: ${userId}`
+          );
+        }
+
+        await recordTransaction({
+          vendorId: userId,
+          plan: "Premium",
+
+          amount: (invoice.amount_paid || 0) / 100,
+
+          currency: invoice.currency,
+
+          stripeInvoiceId: invoice.id,
+          stripeSubscriptionId: subscription.id,
+
+          status: "paid",
+
+          createdAt: invoice.created
+            ? new Date(invoice.created * 1000)
+            : new Date(),
+        });
+
+        console.log("Invoice payment succeeded:", {
+          userId,
+          invoiceId: invoice.id,
+          amount: invoice.amount_paid,
+          currency: invoice.currency,
+        });
+
+        break;
+      }
+
+      // 5. Failed invoice payment
+      case "invoice.payment_failed": {
+        const invoice = event.data.object;
+
+        const subscriptionId =
+          getInvoiceSubscriptionId(invoice);
+
+        if (!subscriptionId) {
+          break;
+        }
+
+        const subscription =
+          await stripe.subscriptions.retrieve(
+            subscriptionId
+          );
+
+        const userId = subscription.metadata?.userId;
+
+        if (!userId || !ObjectId.isValid(userId)) {
+          throw new Error(
+            "Invalid vendor ID in failed invoice metadata."
+          );
+        }
+
+        const vendor = await users.findOne({
+          _id: new ObjectId(userId),
+          role: "vendor",
+        });
+
+        if (
+          !vendor ||
+          (
+            vendor.subscriptionId &&
+            vendor.subscriptionId !== subscription.id
+          )
+        ) {
+          break;
+        }
+
+        const updated = await updateVendorSubscription(
+          userId,
+          subscription
+        );
+
+        if (!updated) {
+          throw new Error(
+            `Failed to update failed subscription: ${userId}`
+          );
+        }
+
+        console.log("Invoice payment failed:", {
+          userId,
+          invoiceId: invoice.id,
+          subscriptionStatus: subscription.status,
+        });
+
+        break;
+      }
+
+      default: {
+        console.log(
+          "Unhandled Stripe Event:",
+          event.type
+        );
+      }
+    }
+
+    // Save event only after successful processing
+    await webhookEvents.insertOne({
+      eventId: event.id,
+      type: event.type,
+      processedAt: new Date(),
+    });
+
+    console.log("Stripe Event Processed:", {
+      eventId: event.id,
+      type: event.type,
+    });
+
+    return res.status(200).json({
+      received: true,
+    });
+
+  } catch (error) {
+    if (error.code === 11000) {
+      return res.status(200).json({
+        received: true,
+        duplicate: true,
+      });
+    }
+
+    console.error("Webhook Processing Error:", {
+      eventId: event.id,
+      eventType: event.type,
+      message: error.message,
+      stack: error.stack,
+    });
+
+    return res.status(500).json({
+      success: false,
+      message: "Webhook processing failed.",
     });
   }
 });
 
-
+/* Legacy duplicate webhook implementation retained only as a reference.
 // 2. Stripe Webhook
 // IMPORTANT: This route must be registered before express.json()
 
@@ -1737,6 +2708,7 @@ app.post(
             plan: "Premium",
             amount: (invoice.amount_paid || 0) / 100,
             currency: invoice.currency,
+            stripeCustomerId: subscription.customer?.toString?.() || subscription.customer,
             stripeInvoiceId: invoice.id,
             stripeSubscriptionId: subscription.id,
             status: "paid",
@@ -1774,69 +2746,74 @@ app.post(
 );
 
 
+*/
+
 // 3. Get All Transactions (Admin Only)
-app.get("/payments/transactions", async (req, res) => {
+
+app.get(["/payments/transactions", "/payments/my-transactions"], verifyToken, async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
 
     if (!user) {
-      return res.status(401).json({ message: "Unauthorized access." });
-    }
-
-    if (user.role !== "admin" && user.role !== "vendor") {
-      return res.status(403).json({
-        message: "Only admins and vendors can view transactions.",
+      return res.status(401).json({
+        success: false,
+        message: "Unauthorized access.",
       });
     }
 
-    const filter = user.role === "vendor"
-      ? { vendorId: String(user.id) }
-      : {};
+    if (!["admin", "vendor"].includes(user.role)) {
+      return res.status(403).json({
+        success: false,
+        message: "Access denied.",
+      });
+    }
+
+    const filter =
+      user.role === "admin"
+        ? {}
+        : {
+            vendorId: String(user.id),
+          };
+
     const transactions = await transactionsCollection
       .find(filter)
       .sort({ createdAt: -1 })
       .toArray();
 
-    const transactionsWithVendor = await Promise.all(
-      transactions.map(async (transaction) => {
-        if (!transaction.vendorId || !ObjectId.isValid(String(transaction.vendorId))) {
-          return transaction;
-        }
-        const vendor = await users.findOne(
-          { _id: new ObjectId(String(transaction.vendorId)) },
-          { projection: { name: 1, email: 1 } }
-        );
-        return {
-          ...transaction,
-          vendorName: transaction.vendorName || vendor?.name,
-          vendorEmail: transaction.vendorEmail || vendor?.email,
-        };
-      })
-    );
-
-    res.status(200).json({
+    return res.status(200).json({
       success: true,
-      total: transactionsWithVendor.length,
-      transactions: transactionsWithVendor,
+      total: transactions.length,
+      transactions,
     });
+
   } catch (error) {
     console.error("Get Transactions Error:", error);
 
-    res.status(500).json({
+    return res.status(500).json({
+      success: false,
       message: "Failed to fetch transactions.",
     });
   }
 });
 
-app.get("/payments/my-subscription", async (req, res) => {
+
+
+app.get("/payments/my-subscription", verifyToken, verifyRole("vendor"), async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
+
     if (!user || user.role !== "vendor") {
-      return res.status(403).json({ message: "Vendor access required." });
+      return res.status(403).json({
+        success: false,
+        message: "Vendor access required.",
+      });
     }
 
     const vendor = await users.findOne(
-      { _id: new ObjectId(user.id) },
+      {
+        _id: new ObjectId(user.id),
+        role: "vendor",
+      },
       {
         projection: {
           subscriptionPlan: 1,
@@ -1847,40 +2824,127 @@ app.get("/payments/my-subscription", async (req, res) => {
           subscriptionExpiresAt: 1,
           subscriptionCancelledAt: 1,
           subscriptionCancelAtPeriodEnd: 1,
+          premium: 1,
         },
       }
     );
 
-    if (!vendor) return res.status(404).json({ message: "Vendor not found." });
-    res.json({ success: true, data: vendor });
+    if (!vendor) {
+      return res.status(404).json({
+        success: false,
+        message: "Vendor not found.",
+      });
+    }
+
+    return res.status(200).json({
+      success: true,
+      data: vendor,
+    });
+
   } catch (error) {
-    console.error("Get subscription error:", error);
-    res.status(500).json({ message: "Failed to fetch subscription." });
+    console.error("Get Subscription Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to fetch subscription.",
+    });
   }
 });
 
-app.post("/payments/cancel-subscription", async (req, res) => {
+
+
+
+app.post("/payments/cancel-subscription", verifyToken, verifyRole("vendor"), async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
+
     if (!user || user.role !== "vendor") {
-      return res.status(403).json({ message: "Vendor access required." });
+      return res.status(403).json({
+        success: false,
+        message: "Vendor access required.",
+      });
     }
 
-    const vendor = await users.findOne({ _id: new ObjectId(user.id) });
-    if (!vendor?.subscriptionId || vendor.subscriptionStatus !== "active") {
-      return res.status(400).json({ message: "No active Premium subscription found." });
-    }
-
-    const subscription = await stripe.subscriptions.update(vendor.subscriptionId, {
-      cancel_at_period_end: true,
+    const vendor = await users.findOne({
+      _id: new ObjectId(user.id),
+      role: "vendor",
     });
+
+    if (
+      !vendor?.subscriptionId ||
+      !isActiveSubscription(vendor.subscriptionStatus)
+    ) {
+      return res.status(400).json({
+        success: false,
+        message: "No active Premium subscription found.",
+      });
+    }
+
+    const currentSubscription = await stripe.subscriptions.retrieve(
+      vendor.subscriptionId
+    );
+
+    if (!isActiveSubscription(currentSubscription.status)) {
+      return res.status(400).json({
+        success: false,
+        message: "Subscription is not active.",
+      });
+    }
+
+    if (currentSubscription.cancel_at_period_end) {
+      return res.status(400).json({
+        success: false,
+        message: "Cancellation is already scheduled.",
+      });
+    }
+
+    const subscription = await stripe.subscriptions.update(
+      vendor.subscriptionId,
+      {
+        cancel_at_period_end: true,
+      }
+    );
+
     await updateVendorSubscription(user.id, subscription);
-    res.json({ success: true, data: subscriptionFields(subscription) });
+
+    return res.status(200).json({
+      success: true,
+      message:
+        "Subscription cancellation scheduled successfully.",
+
+      data: subscriptionFields(subscription),
+    });
+
   } catch (error) {
-    console.error("Cancel subscription error:", error);
-    res.status(500).json({ message: "Failed to schedule subscription cancellation." });
+    console.error("Cancel Subscription Error:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to cancel subscription.",
+    });
   }
 });
+
+
+
+// JSON 404 for unknown API routes (avoids Express' default HTML 404 page).
+app.use((req, res) => {
+  res.status(404).send({
+    success: false,
+    message: `Route not found: ${req.method} ${req.originalUrl}`,
+  });
+});
+
+// Global error handler — always respond with JSON, never leak a stack trace.
+app.use((error, req, res, next) => {
+  console.error("Unhandled error:", error);
+  if (res.headersSent) return next(error);
+  res.status(500).send({
+    success: false,
+    message: "Internal server error",
+  });
+});
+
 
 app.listen(port, () => {
   console.log(`App is running on port ${port}`);
