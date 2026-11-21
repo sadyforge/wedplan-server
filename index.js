@@ -4,10 +4,14 @@ import cors from "cors";
 import "dotenv/config";
 import Stripe from "stripe";
 import { MongoClient, ObjectId } from "mongodb";
+import { createHmac, timingSafeEqual } from "node:crypto";
 
 const stripe=new Stripe(process.env.STRIPE_SECRET_KEY)
 const app = express();
 const port = process.env.PORT || 5000;
+const jwtIssuer = process.env.BACKEND_JWT_ISSUER || "wedplan-client";
+const jwtAudience = process.env.BACKEND_JWT_AUDIENCE || "wedplan-api";
+
 
 // middleware
 app.use(express.json({
@@ -50,7 +54,101 @@ const bookingsCollection =database.collection("bookings");
 const transactionsCollection = database.collection("payments");
 const webhookEvents = database.collection("stripe_webhook_events");
 
-const authBaseUrl = process.env.BETTER_AUTH_URL || "http://localhost:3000";
+const myLogger=(req,res,next)=>{
+  console.log("now hitting the api",req.url, req.query)
+  next()
+}
+
+const base64UrlDecode = (value) => Buffer.from(value, "base64url").toString("utf8");
+
+const verifyToken = async (req, res, next) => {
+  try {
+    const secret = process.env.BACKEND_JWT_SECRET;
+    const authorization = req.headers.authorization || "";
+    const [scheme, token] = authorization.split(" ");
+
+    if (!secret || scheme !== "Bearer" || !token) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const parts = token.split(".");
+    if (parts.length !== 3) return res.status(401).json({ message: "Unauthorized" });
+
+    const [encodedHeader, encodedPayload, encodedSignature] = parts;
+    const header = JSON.parse(base64UrlDecode(encodedHeader));
+    const payload = JSON.parse(base64UrlDecode(encodedPayload));
+    if (header.alg !== "HS256" || header.typ !== "JWT") {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const expectedSignature = createHmac("sha256", secret)
+      .update(`${encodedHeader}.${encodedPayload}`)
+      .digest();
+    const receivedSignature = Buffer.from(encodedSignature, "base64url");
+    if (
+      receivedSignature.length !== expectedSignature.length ||
+      !timingSafeEqual(receivedSignature, expectedSignature)
+    ) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const now = Math.floor(Date.now() / 1000);
+    const audience = Array.isArray(payload.aud) ? payload.aud : [payload.aud];
+    if (
+      typeof payload.sub !== "string" ||
+      !Number.isFinite(payload.exp) ||
+      payload.exp <= now ||
+      (payload.nbf && payload.nbf > now) ||
+      payload.iss !== jwtIssuer ||
+      !audience.includes(jwtAudience)
+    ) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    if (!ObjectId.isValid(payload.sub)) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const user = await users.findOne({ _id: new ObjectId(payload.sub) });
+    if (!user || user.isBlocked === true || user.blocked === true) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    req.user = { ...user, id: user._id.toString() };
+    next();
+  } catch (error) {
+    console.error("JWT verification failed:", error.message);
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+};
+
+
+
+
+
+
+
+const verifyRole = (...roles) => {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).send({
+        success: false,
+        message: "Forbidden: Access denied",
+      });
+    }
+
+    next();
+  };
+};
+
+const verifyVendor=async(req,res,next)=>{
+  if(!req.user || req.user.role !== 'vendor'){
+    res.status(403).send({message:"Forbidden"})
+    return
+  }
+  next()
+}
+
 
 const isActiveSubscription = (status) =>
   status === "active" || status === "trialing";
@@ -108,21 +206,9 @@ async function recordTransaction(transaction) {
 }
 
 async function getAuthenticatedUser(req) {
-  const cookie = req.headers.cookie;
-
-  if (!cookie) return null;
-
-  try {
-    const response = await fetch(`${authBaseUrl}/api/auth/get-session`, {
-      headers: { cookie },
-    });
-    const result = await response.json();
-    return result?.user || result?.data?.user || null;
-  } catch (error) {
-    console.error("Session verification error:", error);
-    return null;
-  }
+  return req.user || null;
 }
+
 
 function validServiceData(data) {
   return (
@@ -158,6 +244,15 @@ app.use(async (req, res, next) => {
       message: "Database connection failed",
     });
   }
+});
+
+const publicRoute = (req) =>
+  req.method === "GET" &&
+  (req.path === "/" || req.path === "/browse-service" || req.path.startsWith("/browse-service/"));
+
+app.use((req, res, next) => {
+  if (req.method === "OPTIONS" || req.path === "/payments/webhook" || publicRoute(req)) return next();
+  return verifyToken(req, res, next);
 });
 
 // home
@@ -315,7 +410,8 @@ app.patch("/users/:id/unblock", async (req, res) => {
 
 // add service
 
-app.post("/services", async (req, res) => {
+app.post("/services",verifyToken,
+  verifyRole("vendor"), async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
 
@@ -385,7 +481,9 @@ app.post("/services", async (req, res) => {
 
 
 // get all services
-app.get("/services", async (req, res) => {
+app.get("/services",verifyToken, async (req, res) => {
+  // console.log('header on the server',req.headers)
+
   try {
     const user = await getAuthenticatedUser(req);
 
@@ -393,7 +491,12 @@ app.get("/services", async (req, res) => {
       user?.role === "admin"
         ? {}
         : user?.role === "vendor"
-          ? { vendorEmail: user.email }
+          ? {
+              $or: [
+                { vendorId: user.id },
+                { vendorEmail: user.email },
+              ],
+            }
           : { status: "approved" };
 
     const result = await services
@@ -414,7 +517,8 @@ app.get("/services", async (req, res) => {
 
 
 // get my services
-app.get("/my-services", async (req, res) => {
+app.get("/my-services",   verifyToken,
+  verifyRole("vendor"),async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
 
@@ -426,7 +530,9 @@ app.get("/my-services", async (req, res) => {
     }
 
     const result = await services
-      .find({ vendorEmail: user.email })
+      .find({
+        $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
+      })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -446,7 +552,8 @@ app.get("/my-services", async (req, res) => {
 
 
 // get vendor services
-app.get("/vendor-services/:email", async (req, res) => {
+app.get("/vendor-services/:email",  verifyToken,
+  verifyRole("vendor"), async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
 
@@ -462,7 +569,9 @@ app.get("/vendor-services/:email", async (req, res) => {
     }
 
     const result = await services
-      .find({ vendorEmail: user.email })
+      .find({
+        $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
+      })
       .sort({ createdAt: -1 })
       .toArray();
 
@@ -479,61 +588,148 @@ app.get("/vendor-services/:email", async (req, res) => {
 
 
 // get single service
+// app.get("/services/:id",verifyToken, async (req, res) => {
+//   try {
+//     const { id } = req.params;
+
+//     if (!ObjectId.isValid(id)) {
+//       return res.status(400).send({
+//         success: false,
+//         message: "Invalid service ID",
+//       });
+//     }
+
+//     const user = await getAuthenticatedUser(req);
+
+//     const filter =
+//       user?.role === "admin"
+//         ? { _id: new ObjectId(id) }
+//         : user?.role === "vendor"
+//           ? {
+//               _id: new ObjectId(id),
+//               $or: [
+//                 { status: "approved" },
+//                 { vendorEmail: user.email },
+//               ],
+//             }
+//           : {
+//               _id: new ObjectId(id),
+//               status: "approved",
+//             };
+
+//     const result = await services.findOne(filter);
+
+//     if (!result) {
+//       return res.status(404).send({
+//         success: false,
+//         message: "Service not found",
+//       });
+//     }
+
+//     res.send({
+//       success: true,
+//       data: result,
+//     });
+//   } catch (error) {
+//     console.error("Get single service error:", error);
+
+//     res.status(500).send({
+//       success: false,
+//       message: "Failed to fetch service",
+//     });
+//   }
+// });
+// app.get("/services/:id", verifyToken, async (req, res) => {
+//   try {
+//     const { id } = req.params;
+//     const user = req.user;
+
+//     if (!ObjectId.isValid(id)) {
+//       return res.status(400).send({ message: "Invalid service ID" });
+//     }
+
+//     const service = await servicesCollection.findOne({
+//       _id: new ObjectId(id),
+//     });
+
+//     if (!service) {
+//       return res.status(404).send({ message: "Service not found" });
+//     }
+
+//     if (user.role === "admin") {
+//       return res.send(service);
+//     }
+
+//     if (user.role === "vendor") {
+//       if (
+//         service.vendorEmail === user.email ||
+//         service.status === "approved"
+//       ) {
+//         return res.send(service);
+//       }
+
+//       return res.status(403).send({ message: "Access denied" });
+//     }
+
+//     if (service.status === "approved") {
+//       return res.send(service);
+//     }
+
+//     return res.status(403).send({ message: "Access denied" });
+//   } catch (error) {
+//     res.status(500).send({ message: "Failed to fetch service" });
+//   }
+// });
+
+
 app.get("/services/:id", async (req, res) => {
   try {
     const { id } = req.params;
+    const user = req.user;
+
+    console.log("Service ID:", id);
+    console.log("Authenticated user:", user?.email);
+
+    if (!user) {
+      return res.status(401).send({ message: "Unauthorized" });
+    }
 
     if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        success: false,
-        message: "Invalid service ID",
-      });
+      return res.status(400).send({ message: "Invalid service ID" });
     }
 
-    const user = await getAuthenticatedUser(req);
-
-    const filter =
-      user?.role === "admin"
-        ? { _id: new ObjectId(id) }
-        : user?.role === "vendor"
-          ? {
-              _id: new ObjectId(id),
-              $or: [
-                { status: "approved" },
-                { vendorEmail: user.email },
-              ],
-            }
-          : {
-              _id: new ObjectId(id),
-              status: "approved",
-            };
-
-    const result = await services.findOne(filter);
-
-    if (!result) {
-      return res.status(404).send({
-        success: false,
-        message: "Service not found",
-      });
-    }
-
-    res.send({
-      success: true,
-      data: result,
+    const service = await services.findOne({
+      _id: new ObjectId(id),
     });
+
+    console.log("Found service:", service);
+    console.log("Service vendor:", service?.vendorEmail);
+    console.log("Current vendor:", user.email);
+
+    if (!service) {
+      return res.status(404).send({ message: "Service not found" });
+    }
+
+    const isOwner =
+      user.role === "vendor" &&
+      (String(service.vendorId) === String(user.id) ||
+        String(service.vendorEmail).toLowerCase() === String(user.email).toLowerCase());
+
+    if (user.role === "admin" || isOwner || service.status === "approved") {
+      return res.send(service);
+    }
+
+    return res.status(403).send({ message: "Access denied" });
   } catch (error) {
-    console.error("Get single service error:", error);
-
-    res.status(500).send({
-      success: false,
-      message: "Failed to fetch service",
-    });
+    console.error("Service details error:", error);
+    return res.status(500).send({ message: "Failed to fetch service" });
   }
 });
 
 
 // update service
-app.patch("/services/:id", async (req, res) => {
+app.patch("/services/:id", verifyToken,
+  verifyRole("vendor"), async (req, res) => {
   try {
     const { id } = req.params;
     const user = await getAuthenticatedUser(req);
@@ -554,7 +750,7 @@ app.patch("/services/:id", async (req, res) => {
 
     const existingService = await services.findOne({
       _id: new ObjectId(id),
-      vendorEmail: user.email,
+      $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
     });
 
     if (!existingService) {
@@ -588,7 +784,7 @@ app.patch("/services/:id", async (req, res) => {
     const result = await services.updateOne(
       {
         _id: new ObjectId(id),
-        vendorEmail: user.email,
+        $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
       },
       {
         $set: {
@@ -625,7 +821,8 @@ app.patch("/services/:id", async (req, res) => {
 
 
 // delete service
-app.delete("/services/:id", async (req, res) => {
+app.delete("/services/:id",   verifyToken,
+async (req, res) => {
   try {
     const { id } = req.params;
     const user = await getAuthenticatedUser(req);
@@ -646,7 +843,10 @@ app.delete("/services/:id", async (req, res) => {
 
     const filter = user.role === "admin"
       ? { _id: new ObjectId(id) }
-      : { _id: new ObjectId(id), vendorEmail: user.email };
+      : {
+          _id: new ObjectId(id),
+          $or: [{ vendorId: user.id }, { vendorEmail: user.email }],
+        };
     const result = await services.deleteOne(filter);
 
     if (!result.deletedCount) {
@@ -672,7 +872,8 @@ app.delete("/services/:id", async (req, res) => {
 
 
 // approve service
-app.patch("/services/:id/approve", async (req, res) => {
+app.patch("/services/:id/approve",  verifyToken,
+  verifyRole("admin"), async (req, res) => {
   try {
     const { id } = req.params;
     const user = await getAuthenticatedUser(req);
@@ -727,7 +928,8 @@ app.patch("/services/:id/approve", async (req, res) => {
 
 
 // reject service
-app.patch("/services/:id/reject", async (req, res) => {
+app.patch("/services/:id/reject",  verifyToken,
+  verifyRole("admin"), async (req, res) => {
   try {
     const { id } = req.params;
     const user = await getAuthenticatedUser(req);
@@ -1128,7 +1330,11 @@ app.get("/vendor-bookings", async (req, res) => {
 
     const result = await bookingsCollection
       .find({
-        vendorId: String(user.id),
+        $or: [
+          { vendorId: String(user.id) },
+          { vendorEmail: String(user.email || "") },
+          { vendorEmail: String(user.email || "").toLowerCase() },
+        ],
       })
       .sort({ createdAt: -1 })
       .toArray();
@@ -1186,7 +1392,11 @@ app.patch("/bookings/:id/status", async (req, res) => {
     const result = await bookingsCollection.updateOne(
       {
         _id: new ObjectId(id),
-        vendorId: String(user.id),
+        $or: [
+          { vendorId: String(user.id) },
+          { vendorEmail: String(user.email || "") },
+          { vendorEmail: String(user.email || "").toLowerCase() },
+        ],
         status: "Pending",
       },
       {
