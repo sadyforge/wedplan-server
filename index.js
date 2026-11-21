@@ -2,13 +2,21 @@
 import express from "express";
 import cors from "cors";
 import "dotenv/config";
+import Stripe from "stripe";
 import { MongoClient, ObjectId } from "mongodb";
 
+const stripe=new Stripe(process.env.STRIPE_SECRET_KEY)
 const app = express();
 const port = process.env.PORT || 5000;
 
 // middleware
-app.use(express.json());
+app.use(express.json({
+  verify: (req, _res, buffer) => {
+    if (req.originalUrl === "/payments/webhook") {
+      req.rawBody = Buffer.from(buffer);
+    }
+  },
+}));
 app.use(
   cors({
     origin: process.env.CLIENT_URL || "http://localhost:3000",
@@ -39,8 +47,65 @@ const payments = database.collection("payments");
 const services = database.collection("service");
 const users = database.collection("user");
 const bookingsCollection =database.collection("bookings");
+const transactionsCollection = database.collection("payments");
+const webhookEvents = database.collection("stripe_webhook_events");
 
 const authBaseUrl = process.env.BETTER_AUTH_URL || "http://localhost:3000";
+
+const isActiveSubscription = (status) =>
+  status === "active" || status === "trialing";
+
+function subscriptionFields(subscription) {
+  const active = isActiveSubscription(subscription.status);
+  return {
+    subscriptionPlan: active ? "Premium" : "Free",
+    subscriptionStatus: active ? "active" : "inactive",
+    subscriptionId: String(subscription.id),
+    stripeCustomerId: subscription.customer?.toString?.() || subscription.customer || null,
+    subscriptionStartedAt: subscription.start_date
+      ? new Date(subscription.start_date * 1000)
+      : new Date(),
+    subscriptionExpiresAt: subscription.current_period_end
+      ? new Date(subscription.current_period_end * 1000)
+      : null,
+    subscriptionCancelledAt: subscription.canceled_at
+      ? new Date(subscription.canceled_at * 1000)
+      : null,
+    subscriptionCancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+  };
+}
+
+async function updateVendorSubscription(userId, subscription) {
+  if (!userId || !ObjectId.isValid(userId)) return false;
+  const result = await users.updateOne(
+    { _id: new ObjectId(userId) },
+    { $set: subscriptionFields(subscription) }
+  );
+  return result.matchedCount > 0;
+}
+
+async function recordTransaction(transaction) {
+  if (transaction.vendorId && ObjectId.isValid(String(transaction.vendorId))) {
+    const vendor = await users.findOne(
+      { _id: new ObjectId(String(transaction.vendorId)) },
+      { projection: { name: 1, email: 1 } }
+    );
+    transaction = {
+      ...transaction,
+      vendorName: transaction.vendorName || vendor?.name || "Vendor",
+      vendorEmail: transaction.vendorEmail || vendor?.email || "",
+    };
+  }
+  const key = transaction.stripeInvoiceId || transaction.stripeSessionId;
+  if (!key) return;
+  await transactionsCollection.updateOne(
+    transaction.stripeInvoiceId
+      ? { stripeInvoiceId: transaction.stripeInvoiceId }
+      : { stripeSessionId: transaction.stripeSessionId },
+    { $setOnInsert: transaction },
+    { upsert: true }
+  );
+}
 
 async function getAuthenticatedUser(req) {
   const cookie = req.headers.cookie;
@@ -100,13 +165,14 @@ app.get("/", (req, res) => {
   res.send("Hello world");
 });
 
-// ==============================
-// USERS ROUTES
-// ==============================
 
 // get all users
 app.get("/users", async (req, res) => {
   try {
+    const user = await getAuthenticatedUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).send({ message: "Only admins can view users." });
+    }
     const result = await users.find({}).toArray();
     res.send(result);
   } catch (error) {
@@ -120,6 +186,10 @@ app.get("/users", async (req, res) => {
 // get single user
 app.get("/users/:id", async (req, res) => {
   try {
+    const user = await getAuthenticatedUser(req);
+    if (!user || user.role !== "admin") {
+      return res.status(403).send({ message: "Only admins can view user details." });
+    }
     const { id } = req.params;
 
     if (!ObjectId.isValid(id)) {
@@ -152,6 +222,10 @@ app.get("/users/:id", async (req, res) => {
 // block user
 app.patch("/users/:id/block", async (req, res) => {
   try {
+    const admin = await getAuthenticatedUser(req);
+    if (!admin || admin.role !== "admin") {
+      return res.status(403).send({ message: "Only admins can block users." });
+    }
     const { id } = req.params;
 
     if (!ObjectId.isValid(id)) {
@@ -193,6 +267,10 @@ app.patch("/users/:id/block", async (req, res) => {
 // unblock user
 app.patch("/users/:id/unblock", async (req, res) => {
   try {
+    const admin = await getAuthenticatedUser(req);
+    if (!admin || admin.role !== "admin") {
+      return res.status(403).send({ message: "Only admins can unblock users." });
+    }
     const { id } = req.params;
 
     if (!ObjectId.isValid(id)) {
@@ -236,6 +314,7 @@ app.patch("/users/:id/unblock", async (req, res) => {
 
 
 // add service
+
 app.post("/services", async (req, res) => {
   try {
     const user = await getAuthenticatedUser(req);
@@ -252,6 +331,30 @@ app.post("/services", async (req, res) => {
         success: false,
         message: "Invalid service data",
       });
+    }
+
+    const vendor = await users.findOne({
+      _id: new ObjectId(user.id),
+    });
+
+    const isPremium =
+      vendor?.subscriptionPlan === "Premium" &&
+      vendor?.subscriptionStatus === "active";
+
+    if (!isPremium) {
+      const serviceCount = await services.countDocuments({
+        vendorId: String(user.id),
+        status: { $in: ["pending", "approved"] },
+      });
+
+      if (serviceCount >= 3) {
+        return res.status(403).send({
+          success: false,
+          code: "SERVICE_LIMIT_REACHED",
+          message:
+            "You have reached your free service limit. Upgrade to Premium to add unlimited services.",
+        });
+      }
     }
 
     const data = {
@@ -534,22 +637,22 @@ app.delete("/services/:id", async (req, res) => {
       });
     }
 
-    if (!user || user.role !== "vendor") {
+    if (!user || !["vendor", "admin"].includes(user.role)) {
       return res.status(403).send({
         success: false,
-        message: "Only vendors can delete services",
+        message: "Only vendors or admins can delete services",
       });
     }
 
-    const result = await services.deleteOne({
-      _id: new ObjectId(id),
-      vendorEmail: user.email,
-    });
+    const filter = user.role === "admin"
+      ? { _id: new ObjectId(id) }
+      : { _id: new ObjectId(id), vendorEmail: user.email };
+    const result = await services.deleteOne(filter);
 
     if (!result.deletedCount) {
       return res.status(404).send({
         success: false,
-        message: "Service not found or you are not the owner",
+        message: "Service not found or you are not allowed to delete it",
       });
     }
 
@@ -1112,6 +1215,460 @@ app.patch("/bookings/:id/status", async (req, res) => {
       success: false,
       message: "Failed to update booking status.",
     });
+  }
+});
+
+
+//payments related apis
+app.post("/payments/checkout-verify", async (req, res) => {
+  try {
+    const { sessionId } = req.body;
+    const authenticatedUser = await getAuthenticatedUser(req);
+
+    if (!authenticatedUser || authenticatedUser.role !== "vendor") {
+      return res.status(401).send({
+        success: false,
+        message: "Authenticated vendor access is required.",
+      });
+    }
+
+    if (!sessionId) {
+      return res.status(400).send({
+        success: false,
+        message: "Session ID is required",
+      });
+    }
+
+    const session = await stripe.checkout.sessions.retrieve(sessionId);
+
+    const {
+      status,
+      payment_status,
+      payment_intent,
+      metadata,
+      customer_email,
+    } = session;
+
+    if (status !== "complete" || payment_status !== "paid") {
+      return res.status(400).send({
+        success: false,
+        message: "Payment verification failed",
+      });
+    }
+
+    if (!metadata?.userId || !ObjectId.isValid(metadata.userId)) {
+      return res.status(400).send({
+        success: false,
+        message: "Invalid user information",
+      });
+    }
+
+    if (String(authenticatedUser.id) !== String(metadata.userId)) {
+      return res.status(403).send({
+        success: false,
+        message: "This checkout session does not belong to the authenticated vendor.",
+      });
+    }
+
+    const subscription = session.subscription
+      ? await stripe.subscriptions.retrieve(session.subscription)
+      : null;
+    const vendor = await users.findOne({ _id: new ObjectId(metadata.userId) });
+
+    if (!vendor || !subscription || !isActiveSubscription(subscription.status)) {
+      return res.status(400).send({
+        success: false,
+        message: "Payment verification failed because the subscription is not active.",
+      });
+    }
+
+    const subscriptionData = subscriptionFields(subscription);
+    await users.updateOne(
+      { _id: new ObjectId(metadata.userId) },
+      { $set: { ...subscriptionData, premium: true } }
+    );
+
+    await recordTransaction({
+      vendorId: metadata.userId,
+      plan: "Premium",
+      amount: (session.amount_total || 0) / 100,
+      currency: session.currency,
+      stripeSessionId: session.id,
+      stripeSubscriptionId: subscription.id,
+      status: "paid",
+      createdAt: new Date(),
+    });
+
+    return res.send({
+      success: true,
+      verified: true,
+      subscriptionStatus: "active",
+      subscriptionPlan: "Premium",
+      subscriptionId: subscription.id,
+      message: "Premium subscription activated successfully.",
+    });
+  } catch (error) {
+    console.error("Checkout verification error:", error);
+
+    return res.status(500).send({
+      success: false,
+      message: "Payment verification failed",
+    });
+  }
+});
+
+app.get("/users/:id/premium",async(req,res)=>{
+  const id=req.params.id
+  const query={_id:new ObjectId(id)}
+  const result=await users.findOne(query,{projection:{premium:1}})
+  res.send(result)
+})
+
+
+
+// 1. Create Stripe Checkout Session
+app.post("/payments/create-checkout-session", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized access." });
+    }
+
+    if (user.role !== "vendor") {
+      return res.status(403).json({ message: "Only vendors can subscribe." });
+    }
+
+    const userId = user._id?.toString() || user.id;
+
+    if (!userId) {
+      return res.status(400).json({ message: "User ID not found." });
+    }
+
+    const existingUser = await users.findOne({
+      _id: new ObjectId(userId),
+    });
+
+    if (!existingUser) {
+      return res.status(404).json({ message: "Vendor not found." });
+    }
+
+    if (
+      existingUser.subscriptionPlan === "Premium" &&
+      existingUser.subscriptionStatus === "active"
+    ) {
+      return res.status(400).json({
+        message: "You already have a Premium subscription.",
+      });
+    }
+
+    const priceId = process.env.PREMIUM_PRICE_ID;
+    const lineItem = priceId
+      ? { price: priceId, quantity: 1 }
+      : {
+          price_data: {
+            currency: (process.env.PREMIUM_CURRENCY || "bdt").toLowerCase(),
+            product_data: {
+              name: "WedPlan Premium",
+              description: "Unlimited active services and Premium badge",
+            },
+            unit_amount: Number(process.env.PREMIUM_PRICE_AMOUNT || 99900),
+            recurring: { interval: "month" },
+          },
+          quantity: 1,
+        };
+
+    const session = await stripe.checkout.sessions.create({
+      mode: "subscription",
+      line_items: [lineItem],
+
+      customer_email: user.email,
+
+      metadata: {
+        userId,
+      },
+
+      subscription_data: {
+        metadata: {
+          userId,
+        },
+      },
+
+      success_url: `${process.env.CLIENT_URL}/payment-success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: `${process.env.CLIENT_URL}/payment-cancel`,
+    });
+
+    res.status(200).json({
+      success: true,
+      url: session.url,
+    });
+  } catch (error) {
+    console.error("Checkout Session Error:", error);
+
+    res.status(500).json({
+      message: "Failed to create checkout session.",
+    });
+  }
+});
+
+
+// 2. Stripe Webhook
+// IMPORTANT: This route must be registered before express.json()
+
+app.post(
+  "/payments/webhook",
+  express.raw({ type: "application/json" }),
+  async (req, res) => {
+    const signature = req.headers["stripe-signature"];
+
+    let event;
+
+    try {
+      event = stripe.webhooks.constructEvent(
+        req.rawBody || req.body,
+        signature,
+        process.env.STRIPE_WEBHOOK_SECRET
+      );
+    } catch (error) {
+      console.error("Webhook Signature Error:", error.message);
+
+      return res.status(400).send(`Webhook Error: ${error.message}`);
+    }
+
+    try {
+      const duplicate = await webhookEvents.findOne({ eventId: event.id });
+      if (duplicate) return res.status(200).json({ received: true, duplicate: true });
+
+      switch (event.type) {
+        // Payment successful
+        case "checkout.session.completed": {
+          const session = event.data.object;
+
+          if (
+            session.mode !== "subscription" ||
+            session.payment_status !== "paid"
+          ) {
+            break;
+          }
+
+          const userId = session.metadata?.userId;
+
+          if (!userId || !ObjectId.isValid(userId)) {
+            break;
+          }
+
+          const subscription = await stripe.subscriptions.retrieve(
+            session.subscription
+          );
+
+          await updateVendorSubscription(userId, subscription);
+          await recordTransaction({
+            vendorId: userId,
+            plan: "Premium",
+            amount: (session.amount_total || 0) / 100,
+            currency: session.currency,
+            stripeSessionId: session.id,
+            stripeSubscriptionId: session.subscription,
+            status: "paid",
+            createdAt: new Date(),
+          });
+
+          break;
+        }
+
+        case "customer.subscription.created":
+        case "customer.subscription.updated": {
+          const subscription = event.data.object;
+          const userId = subscription.metadata?.userId;
+
+          if (!userId || !ObjectId.isValid(userId)) {
+            break;
+          }
+
+          await updateVendorSubscription(userId, subscription);
+
+          break;
+        }
+
+        // Subscription cancelled or expired
+        case "customer.subscription.deleted": {
+          const subscription = event.data.object;
+          const userId = subscription.metadata?.userId;
+
+          if (!userId || !ObjectId.isValid(userId)) {
+            break;
+          }
+
+          await users.updateOne(
+            { _id: new ObjectId(userId) },
+            {
+              $set: {
+                subscriptionPlan: "Free",
+                subscriptionStatus: "inactive",
+                subscriptionExpiresAt: null,
+                subscriptionCancelledAt: new Date(),
+              },
+            }
+          );
+
+          break;
+        }
+
+        case "invoice.payment_succeeded": {
+          const invoice = event.data.object;
+          const subscriptionId = invoice.subscription?.toString?.() || invoice.subscription;
+          if (!subscriptionId) break;
+          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+          const userId = subscription.metadata?.userId;
+          if (!userId || !ObjectId.isValid(userId)) break;
+          await updateVendorSubscription(userId, subscription);
+          await recordTransaction({
+            vendorId: userId,
+            plan: "Premium",
+            amount: (invoice.amount_paid || 0) / 100,
+            currency: invoice.currency,
+            stripeInvoiceId: invoice.id,
+            stripeSubscriptionId: subscription.id,
+            status: "paid",
+            createdAt: new Date(),
+          });
+          break;
+        }
+
+        case "invoice.payment_failed": {
+          const invoice = event.data.object;
+          const subscriptionId = invoice.subscription?.toString?.() || invoice.subscription;
+          if (!subscriptionId) break;
+          const subscription = await stripe.subscriptions.retrieve(subscriptionId);
+          const userId = subscription.metadata?.userId;
+          if (!userId || !ObjectId.isValid(userId)) break;
+          await updateVendorSubscription(userId, subscription);
+
+          break;
+        }
+
+        default:
+          console.log(`Unhandled event type: ${event.type}`);
+      }
+
+      await webhookEvents.insertOne({ eventId: event.id, type: event.type, processedAt: new Date() });
+      res.status(200).json({ received: true });
+    } catch (error) {
+      console.error("Webhook Processing Error:", error);
+
+      res.status(500).json({
+        message: "Webhook processing failed.",
+      });
+    }
+  }
+);
+
+
+// 3. Get All Transactions (Admin Only)
+app.get("/payments/transactions", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+
+    if (!user) {
+      return res.status(401).json({ message: "Unauthorized access." });
+    }
+
+    if (user.role !== "admin" && user.role !== "vendor") {
+      return res.status(403).json({
+        message: "Only admins and vendors can view transactions.",
+      });
+    }
+
+    const filter = user.role === "vendor"
+      ? { vendorId: String(user.id) }
+      : {};
+    const transactions = await transactionsCollection
+      .find(filter)
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    const transactionsWithVendor = await Promise.all(
+      transactions.map(async (transaction) => {
+        if (!transaction.vendorId || !ObjectId.isValid(String(transaction.vendorId))) {
+          return transaction;
+        }
+        const vendor = await users.findOne(
+          { _id: new ObjectId(String(transaction.vendorId)) },
+          { projection: { name: 1, email: 1 } }
+        );
+        return {
+          ...transaction,
+          vendorName: transaction.vendorName || vendor?.name,
+          vendorEmail: transaction.vendorEmail || vendor?.email,
+        };
+      })
+    );
+
+    res.status(200).json({
+      success: true,
+      total: transactionsWithVendor.length,
+      transactions: transactionsWithVendor,
+    });
+  } catch (error) {
+    console.error("Get Transactions Error:", error);
+
+    res.status(500).json({
+      message: "Failed to fetch transactions.",
+    });
+  }
+});
+
+app.get("/payments/my-subscription", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user || user.role !== "vendor") {
+      return res.status(403).json({ message: "Vendor access required." });
+    }
+
+    const vendor = await users.findOne(
+      { _id: new ObjectId(user.id) },
+      {
+        projection: {
+          subscriptionPlan: 1,
+          subscriptionStatus: 1,
+          subscriptionId: 1,
+          stripeCustomerId: 1,
+          subscriptionStartedAt: 1,
+          subscriptionExpiresAt: 1,
+          subscriptionCancelledAt: 1,
+          subscriptionCancelAtPeriodEnd: 1,
+        },
+      }
+    );
+
+    if (!vendor) return res.status(404).json({ message: "Vendor not found." });
+    res.json({ success: true, data: vendor });
+  } catch (error) {
+    console.error("Get subscription error:", error);
+    res.status(500).json({ message: "Failed to fetch subscription." });
+  }
+});
+
+app.post("/payments/cancel-subscription", async (req, res) => {
+  try {
+    const user = await getAuthenticatedUser(req);
+    if (!user || user.role !== "vendor") {
+      return res.status(403).json({ message: "Vendor access required." });
+    }
+
+    const vendor = await users.findOne({ _id: new ObjectId(user.id) });
+    if (!vendor?.subscriptionId || vendor.subscriptionStatus !== "active") {
+      return res.status(400).json({ message: "No active Premium subscription found." });
+    }
+
+    const subscription = await stripe.subscriptions.update(vendor.subscriptionId, {
+      cancel_at_period_end: true,
+    });
+    await updateVendorSubscription(user.id, subscription);
+    res.json({ success: true, data: subscriptionFields(subscription) });
+  } catch (error) {
+    console.error("Cancel subscription error:", error);
+    res.status(500).json({ message: "Failed to schedule subscription cancellation." });
   }
 });
 
