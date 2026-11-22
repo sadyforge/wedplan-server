@@ -17,7 +17,7 @@ const jwtAudience = process.env.BACKEND_JWT_AUDIENCE || "wedplan-api";
 app.use(
   express.json({
     verify: (req, _res, buffer) => {
-      if (req.path === "/payments/webhook") {
+      if (req.path === "/payments/webhook" || req.originalUrl?.split("?")[0] === "/payments/webhook") {
         req.rawBody = Buffer.from(buffer);
       }
     },
@@ -297,7 +297,7 @@ async function recordTransaction(transaction) {
   };
 
   if (transaction.stripeInvoiceId) {
-    await transactionsCollection.updateOne(
+    const result = await transactionsCollection.updateOne(
       {
         stripeInvoiceId: transaction.stripeInvoiceId,
       },
@@ -309,11 +309,20 @@ async function recordTransaction(transaction) {
       }
     );
 
-    return;
+    console.log("TRANSACTION RESULT (by invoice):", {
+      stripeInvoiceId: transaction.stripeInvoiceId,
+      vendorId,
+      upsertedCount: result.upsertedCount,
+      matchedCount: result.matchedCount,
+      modifiedCount: result.modifiedCount,
+      isNew: result.upsertedCount > 0,
+    });
+
+    return result;
   }
 
   if (transaction.stripeSessionId) {
-    await transactionsCollection.updateOne(
+    const result = await transactionsCollection.updateOne(
       {
         stripeSessionId: transaction.stripeSessionId,
       },
@@ -325,18 +334,38 @@ async function recordTransaction(transaction) {
       }
     );
 
-    return;
+    console.log("TRANSACTION RESULT (by session):", {
+      stripeSessionId: transaction.stripeSessionId,
+      vendorId,
+      upsertedCount: result.upsertedCount,
+      matchedCount: result.matchedCount,
+      modifiedCount: result.modifiedCount,
+      isNew: result.upsertedCount > 0,
+    });
+
+    return result;
   }
 
   throw new Error("Stripe transaction reference is required");
 }
 
 function getInvoiceSubscriptionId(invoice) {
+  if (!invoice) return null;
+
+  const parseSub = (sub) => {
+    if (!sub) return null;
+    if (typeof sub === "string" && sub.trim()) return sub.trim();
+    if (typeof sub === "object" && typeof sub.id === "string" && sub.id.trim()) return sub.id.trim();
+    return null;
+  };
+
   return (
-    invoice.subscription?.toString?.() ||
-    invoice.subscription ||
-    invoice.parent?.subscription_details?.subscription?.toString?.() ||
-    invoice.parent?.subscription_details?.subscription ||
+    parseSub(invoice.subscription) ||
+    parseSub(invoice.parent?.subscription_details?.subscription) ||
+    parseSub(invoice.subscription_details?.subscription) ||
+    parseSub(invoice.lines?.data?.[0]?.subscription) ||
+    parseSub(invoice.lines?.data?.[0]?.parent?.subscription_item_details?.subscription) ||
+    parseSub(invoice.lines?.data?.[0]?.parent?.subscription_details?.subscription) ||
     null
   );
 }
@@ -1765,6 +1794,31 @@ if (
 
 await updateVendorSubscription(String(user.id), subscription);
 
+const verifyInvoiceId =
+  (typeof session.invoice === "string" ? session.invoice : session.invoice?.id) ||
+  (typeof subscription.latest_invoice === "string" ? subscription.latest_invoice : subscription.latest_invoice?.id) ||
+  null;
+
+if (verifyInvoiceId || session.id) {
+  try {
+    await recordTransaction({
+      vendorId: String(user.id),
+      plan: "Premium",
+      amount: (session.amount_total || 0) / 100,
+      currency: session.currency || "bdt",
+      paymentMethod: "card",
+      paymentStatus: session.payment_status || "paid",
+      stripeInvoiceId: verifyInvoiceId,
+      stripeSubscriptionId: subscription.id,
+      stripeSessionId: session.id,
+      paymentDate: new Date(),
+      createdAt: new Date(),
+    });
+  } catch (txError) {
+    console.warn("Checkout verify recordTransaction notice:", txError.message);
+  }
+}
+
 const updatedVendor = await users.findOne({
   _id: new ObjectId(user.id),
   role: "vendor",
@@ -2111,15 +2165,6 @@ app.post(
 
 
 //webhook
-app.use(
-  express.json({
-    verify: (req, res, buffer) => {
-      if (req.originalUrl === "/payments/webhook") {
-        req.rawBody = Buffer.from(buffer);
-      }
-    },
-  })
-);
 app.post("/payments/webhook", async (req, res) => {
   const signature = req.headers["stripe-signature"];
 
@@ -2262,9 +2307,29 @@ app.post("/payments/webhook", async (req, res) => {
           throw new Error(`Vendor subscription readback did not confirm activation for ${userId}.`);
         }
 
-        console.log("Checkout subscription updated:", {
+        const checkoutInvoiceId =
+          (typeof session.invoice === "string" ? session.invoice : session.invoice?.id) ||
+          (typeof subscription.latest_invoice === "string" ? subscription.latest_invoice : subscription.latest_invoice?.id) ||
+          null;
+
+        await recordTransaction({
+          vendorId: userId,
+          plan: "Premium",
+          amount: (session.amount_total || 0) / 100,
+          currency: session.currency || "bdt",
+          paymentMethod: "card",
+          paymentStatus: session.payment_status || "paid",
+          stripeInvoiceId: checkoutInvoiceId,
+          stripeSubscriptionId: subscription.id,
+          stripeSessionId: session.id,
+          paymentDate: new Date(),
+          createdAt: new Date(),
+        });
+
+        console.log("Checkout subscription updated and transaction recorded:", {
           userId,
           subscriptionId: subscription.id,
+          invoiceId: checkoutInvoiceId,
           status: subscription.status,
         });
 
@@ -2418,34 +2483,51 @@ app.post("/payments/webhook", async (req, res) => {
             subscriptionId
           );
 
-        const userId = subscription.metadata?.userId;
+        let userId =
+          subscription.metadata?.userId ||
+          invoice.metadata?.userId ||
+          invoice.parent?.subscription_details?.metadata?.userId ||
+          invoice.subscription_details?.metadata?.userId ||
+          invoice.lines?.data?.[0]?.metadata?.userId ||
+          null;
 
-        if (!userId || !ObjectId.isValid(userId)) {
-          throw new Error(
-            "Invalid vendor ID in invoice subscription metadata."
-          );
+        let vendor = null;
+        if (userId && ObjectId.isValid(userId)) {
+          vendor = await users.findOne({
+            _id: new ObjectId(userId),
+            role: "vendor",
+          });
         }
-
-        const vendor = await users.findOne({
-          _id: new ObjectId(userId),
-          role: "vendor",
-        });
 
         if (!vendor) {
-          throw new Error(
-            `Invoice vendor not found: ${userId}`
-          );
+          const customerId =
+            (typeof invoice.customer === "string" ? invoice.customer : invoice.customer?.id) ||
+            (typeof subscription.customer === "string" ? subscription.customer : subscription.customer?.id) ||
+            null;
+
+          if (customerId) {
+            vendor = await users.findOne({
+              stripeCustomerId: customerId,
+              role: "vendor",
+            });
+          }
+
+          if (!vendor && subscription.id) {
+            vendor = await users.findOne({
+              subscriptionId: subscription.id,
+              role: "vendor",
+            });
+          }
+
+          if (vendor) {
+            userId = vendor._id.toString();
+          }
         }
 
-        if (
-          vendor.subscriptionId &&
-          vendor.subscriptionId !== subscription.id
-        ) {
-          console.log(
-            "Ignoring invoice from old subscription:",
-            subscription.id
+        if (!vendor || !userId || !ObjectId.isValid(userId)) {
+          throw new Error(
+            `Invoice vendor not found for invoice ${invoice.id} (subscription: ${subscriptionId})`
           );
-          break;
         }
 
         const updated = await updateVendorSubscription(
@@ -2459,29 +2541,38 @@ app.post("/payments/webhook", async (req, res) => {
           );
         }
 
+        const paymentDate = invoice.status_transitions?.paid_at
+          ? new Date(invoice.status_transitions.paid_at * 1000)
+          : invoice.created
+          ? new Date(invoice.created * 1000)
+          : new Date();
+
         await recordTransaction({
           vendorId: userId,
           plan: "Premium",
-
           amount: (invoice.amount_paid || 0) / 100,
-
           currency: invoice.currency,
-
+          paymentMethod: "card",
+          paymentStatus: "paid",
           stripeInvoiceId: invoice.id,
           stripeSubscriptionId: subscription.id,
-
-          status: "paid",
-
+          stripePaymentIntentId:
+            typeof invoice.payment_intent === "string"
+              ? invoice.payment_intent
+              : invoice.payment_intent?.id || null,
+          paymentDate,
           createdAt: invoice.created
             ? new Date(invoice.created * 1000)
             : new Date(),
         });
 
-        console.log("Invoice payment succeeded:", {
+        console.log("Invoice payment succeeded and transaction recorded:", {
           userId,
           invoiceId: invoice.id,
-          amount: invoice.amount_paid,
+          subscriptionId: subscription.id,
+          amount: (invoice.amount_paid || 0) / 100,
           currency: invoice.currency,
+          paymentDate,
         });
 
         break;
@@ -2949,3 +3040,6 @@ app.use((error, req, res, next) => {
 app.listen(port, () => {
   console.log(`App is running on port ${port}`);
 });
+
+
+export default app;
